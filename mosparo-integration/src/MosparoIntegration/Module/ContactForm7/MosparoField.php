@@ -1,0 +1,266 @@
+<?php
+
+namespace MosparoIntegration\Module\ContactForm7;
+
+use MosparoIntegration\Helper\ConfigHelper;
+use MosparoIntegration\Helper\FrontendHelper;
+use MosparoIntegration\Helper\VerificationHelper;
+use WPCF7_FormTag;
+use WPCF7_Submission;
+
+class MosparoField
+{
+    private static $instance;
+
+    protected $originalValues = [];
+
+    public static function getInstance()
+    {
+        if (empty(self::$instance)) {
+            self::$instance = new self();
+        }
+
+        return self::$instance;
+    }
+
+    private function __construct()
+    {
+    }
+
+    public function registerHooks()
+    {
+        add_action('wpcf7_init', [$this, 'addFormTag'], 10, 0);
+        add_filter('wpcf7_spam', [$this, 'verifyResponse'], 9, 2);
+        add_action('wpcf7_admin_init', [$this, 'addFormTagGenerator'], 100);
+
+        // Register the filters to store the original value
+        add_action('wpcf7_posted_data_select', [$this, 'storeOriginalValue'], 10, 3);
+        add_action('wpcf7_posted_data_select*', [$this, 'storeOriginalValue'], 10, 3);
+    }
+
+    public function addFormTag()
+    {
+        wpcf7_add_form_tag('mosparo', [$this, 'displayFormField'], []);
+    }
+
+    public function addFormTagGenerator()
+    {
+        wpcf7_add_tag_generator('mosparo', 'mosparo', '', [$this, 'getTagGeneratorContent'], ['nameless' => 1, 'version' => 2]);
+    }
+
+    public function displayFormField()
+    {
+        $configHelper = ConfigHelper::getInstance();
+        $connection = $configHelper->getConnectionFor('module_contact-form-7');
+        if ($connection === false) {
+            return __('No mosparo connection available. Please configure the connection in the mosparo settings.', 'mosparo-integration');
+        }
+
+        $frontendHelper = FrontendHelper::getInstance();
+        return $frontendHelper->generateField($connection, [], $this);
+    }
+
+    public function storeOriginalValue($value, $originalValue, WPCF7_FormTag $tag)
+    {
+        $this->originalValues[$tag->name] = $originalValue;
+
+        return $value;
+    }
+
+    public function verifyResponse($spam, WPCF7_Submission $submission)
+    {
+        if ($spam) {
+            return $spam;
+        }
+
+        // Stop the verification if the mosparo tag is not found in the form
+        if (!$this->searchMosparoFieldInForm($submission)) {
+            return $spam;
+        }
+
+        $configHelper = ConfigHelper::getInstance();
+        $connection = $configHelper->getConnectionFor('module_contact-form-7');
+        if ($connection === false) {
+            return $spam;
+        }
+
+        [ $formData, $requiredFields, $verifiableFields ] = $this->getFormData($submission);
+        $submitToken = trim(sanitize_text_field($formData['_mosparo_submitToken'] ?? ''));
+        $validationToken = trim(sanitize_text_field($formData['_mosparo_validationToken'] ?? ''));
+
+        // If the tokens are not available, the submission cannot be valid.
+        if (empty($submitToken) || empty($validationToken)) {
+            $submission->add_spam_log([
+                'agent' => 'mosparo-integration-cf7',
+                'reason' => __('Submit or validation token is empty.', 'mosparo-integration'),
+            ]);
+
+            return true;
+        }
+        
+        // Remove the mosparo fields from the form data
+        $formData = array_filter($formData, function($key) {
+            return strpos($key, '_mosparo_') === false;
+        }, ARRAY_FILTER_USE_KEY);
+
+        // Verify the submission
+        $verificationHelper = VerificationHelper::getInstance();
+        $verificationResult = $verificationHelper->verifySubmission($connection, $submitToken, $validationToken, $formData);
+        if ($verificationResult !== null) {
+            // Confirm that all required fields were verified
+            $verifiedFields = array_keys($verificationResult->getVerifiedFields());
+            $fieldDifference = array_diff($requiredFields, $verifiedFields);
+            $verifiableFieldDifference = array_diff($verifiableFields, $verifiedFields);
+
+            if ($verificationResult->isSubmittable() && empty($fieldDifference) && empty($verifiableFieldDifference)) {
+                return false;
+            }
+        }
+
+        // Everything else is spam
+        $submission->add_spam_log( array(
+            'agent' => 'mosparo-integration-cf7',
+            'reason' => __('Verification failed which means the form contains spam.', 'mosparo-integration')
+        ));
+
+        return true;
+    }
+
+    protected function getFormData(WPCF7_Submission $submission): array
+    {
+        $requiredFields = [];
+        $verifiableFields = [];
+        $ignoredTypes = apply_filters('mosparo_integration_cf7_ignored_field_types', [
+            'checkbox',
+            'checkbox*',
+            'radio',
+            'acceptance',
+            'hidden',
+            'file',
+            'file*',
+            'submit',
+            'mosparo'
+        ]);
+        $verifiableFieldTypes = apply_filters('mosparo_integration_cf7_verifiable_field_types', [
+            'text',
+            'text*',
+            'textarea',
+            'textarea*',
+            'email',
+            'email*',
+            'url',
+            'url*',
+        ]);
+
+        $formData = (array) $_POST;
+        $tags = $submission->get_contact_form()->scan_form_tags();
+
+        $formData = array_filter($formData, function($key) {
+            return substr($key, 0, 6) !== '_wpcf7';
+        }, ARRAY_FILTER_USE_KEY);
+
+        foreach ((array) $tags as $tag) {
+            if (empty($tag->name)) {
+                continue;
+            }
+
+            if (in_array($tag->type, $ignoredTypes) || in_array('class:mosparo__ignored-field', $tag->options)) {
+                if (isset($formData[$tag->name])) {
+                    unset($formData[$tag->name]);
+                }
+
+                continue;
+            }
+
+            if (substr($tag->type, -1) === '*') {
+                $requiredFields[] = $tag->name;
+            }
+
+            $value = null;
+            if (isset($this->originalValues[$tag->name])) {
+                $value = $this->originalValues[$tag->name];
+            } else {
+                $value = $submission->get_posted_data($tag->name);
+            }
+
+            // If a select field allows multiple values but is not filled out, we have to make sure that we send an
+            // array to mosparo, since otherwise, the comparison is a string against an array, which will always fail.
+            if (strpos($tag->type, 'select') === 0 && in_array('multiple', $tag->options) && !is_array($value)) {
+                $value = [$value];
+            }
+
+            // Contact Form 7 trims the values. If the value contains a space at the start or the end, mosparo will
+            // detect this as a manipulated field and blocks the submission. Because of this, we're using the $_POST
+            // value if the trimmed $_POST value is the same as the prepared Contact Form 7 value.
+            if (isset($formData[$tag->name]) && $formData[$tag->name] !== $value && stripslashes(trim($formData[$tag->name])) === $value) {
+                $value = $formData[$tag->name];
+            }
+
+            $formData[$tag->name] = stripslashes_deep($value);
+
+            if (in_array($tag->type, $verifiableFieldTypes)) {
+                $verifiableFields[] = $tag->name;
+            }
+        }
+
+        $formData = apply_filters('mosparo_integration_cf7_form_data', $formData);
+
+        return [ $formData, $requiredFields, $verifiableFields ];
+    }
+
+    public function getTagGeneratorContent()
+    {
+        ?>
+        <header class="description-box">
+            <h3><?php echo esc_html(__('mosparo form tag generator', 'mosparo-integration')); ?></h3>
+            <p>
+                <?php
+                    echo sprintf(
+                        __('Adds a mosparo field to your form. Please configure the connection to mosparo in the %ssettings%s.', 'mosparo-integration'),
+                        '<a href="' . esc_url(get_admin_url(null, 'options-general.php?page=mosparo-configuration')) . '" target="_blank">',
+                        '</a>'
+                    );
+                ?>
+            </p>
+        </header>
+        <div class="control-box">
+            <fieldset>
+                <legend id="tag-generator-panel-mosparo-type-legend">
+                    <?php echo esc_html(__('Field type', 'contact-form-7')); ?>
+                </legend>
+                <select data-tag-part="basetype" aria-labelledby="tag-generator-panel-mosparo-type-legend">
+                    <option value="mosparo">mosparo</option>
+                </select>
+            </fieldset>
+
+            <fieldset>
+                <legend id="tag-generator-panel-mosparo-class-legend">
+                    <?php echo esc_html(__('Class attribute', 'contact-form-7')); ?>
+                </legend>
+                <input type="text" data-tag-part="option" data-tag-option="class:" aria-labelledby="tag-generator-panel-mosparo-id-legend" />
+            </fieldset>
+        </div>
+
+        <footer class="insert-box">
+            <div class="flex-container">
+                <input type="text" class="code" readonly="readonly" onfocus="this.select()" data-tag-part="tag" aria-label="<?php echo esc_html(__('The form-tag to be inserted into the form template', 'contact-form-7')); ?>">
+                <button type="button" class="button-primary" data-taggen="insert-tag">
+                    <?php echo esc_attr(__('Insert Tag', 'contact-form-7')); ?>
+                </button>
+            </div>
+        </footer>
+        <?php
+    }
+
+    protected function searchMosparoFieldInForm(WPCF7_Submission $submission)
+    {
+        $tags = $submission->get_contact_form()->scan_form_tags();
+        foreach ($tags as $tag) {
+            if ($tag->type === 'mosparo') {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
